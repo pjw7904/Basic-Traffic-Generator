@@ -45,7 +45,7 @@ def main():
     argParser.add_argument("-a", "--analyze") # argument of capture needed
 
     # Shared arguments.
-    argParser.add_argument("-e", "--port", type = int, default="eth1") # By default, it's eth1 on our testbeds.
+    argParser.add_argument("-e", "--port", default="eth1") # By default, it's eth1 on our testbeds.
 
     # Parse the arguments.
     args = argParser.parse_args()
