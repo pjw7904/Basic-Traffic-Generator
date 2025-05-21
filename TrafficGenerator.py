@@ -41,7 +41,7 @@ def main():
     argParser.add_argument("-d", "--delay", type = float) # Add a delay when sending traffic.
 
     # Receiver arguments.
-    argParser.add_argument("-r", "--receive", action = "store_true") # Receive traffic on eth1
+    argParser.add_argument("-r", "--receive", default="result.pcap") # Receive traffic to result.pcap by default
     argParser.add_argument("-a", "--analyze") # argument of capture needed
 
     # Shared arguments.
@@ -130,18 +130,18 @@ def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, d
 
     return None
 
-def recvTraffic(port):
+def recvTraffic(port, captureFilePath):
     global frameCounter
 
     srcPhysicalAddr = get_if_hwaddr(port)
 
     filterToUse = "ether src not {} and {}" # example full cmd: tcpdump -i eth1 ether src not 02:de:3a:3f:a2:fd and icmp
-    commandToUse = 'sudo tshark -i eth1 -w results.pcap -F libpcap {}'
+    commandToUse = 'sudo tshark -i eth1 -w {} -F libpcap {}'
 
     try:
         filterForEIBPTraffic = '"icmp[0] == 1"'
         filterToUse = filterToUse.format(srcPhysicalAddr, filterForEIBPTraffic)
-        commandToUse = commandToUse.format(filterToUse)
+        commandToUse = commandToUse.format(captureFilePath, filterToUse)
         call(commandToUse, shell=True)
 
     except KeyboardInterrupt:
