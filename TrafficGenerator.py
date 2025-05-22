@@ -25,6 +25,7 @@
 
 from scapy.all import *
 from subprocess import call
+from pathlib import Path
 import time
 import argparse
 import sys
@@ -149,10 +150,10 @@ def recvTraffic(port, captureFilePath):
 
     return None
 
-def analyzeTraffic(capture):
+def analyzeTraffic(capturePath):
     frameCounter = {}
 
-    capture = rdpcap(capture)
+    capture = rdpcap(capturePath)
 
     for frame in capture:
         if(frame[ICMP].type == 1):
@@ -198,7 +199,16 @@ def analyzeTraffic(capture):
             frameCounter[source][0] = newSeqNum # Update the current sequence number
             frameCounter[source][2] += 1        # Update how many frames we have received from this source in total
 
-    f = open("trafficResult.txt", "w+")
+
+    # Write the results file to the same directory the pcap is located.
+    pcap_path = Path(capturePath).expanduser().resolve()  # absolute Path to the pcap
+    pcap_dir  = pcap_path.parent                          # directory containing the pcap
+    pcap_stem = pcap_path.stem                            # file name without extension
+
+    pcap_dir = Path(capturePath).expanduser().resolve().parent
+    resultFile = pcap_dir / f"{pcap_stem}_result.txt"
+    f = open(resultFile, "w+")
+
     for source in frameCounter:
         endStatement = "{0} frames lost from source {1} {2} | {3} received | {4} Not sequential {5} | {6} duplicates {7}\n"
         outputMissingFrames = ""
