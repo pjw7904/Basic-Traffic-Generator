@@ -41,7 +41,7 @@ def main():
     argParser.add_argument("-d", "--delay", type = float) # Add a delay when sending traffic.
 
     # Receiver arguments.
-    argParser.add_argument("-r", "--receive", default="result.pcap") # Receive traffic to result.pcap by default
+    argParser.add_argument("-r", "--receive") # Receive traffic to result.pcap by default
     argParser.add_argument("-a", "--analyze") # argument of capture needed
 
     # Shared arguments.
@@ -53,7 +53,7 @@ def main():
 
     # Receive traffic.
     if(args.receive):
-        recvTraffic(port)
+        recvTraffic(port, args.receive)
 
     # Send traffic.
     elif(args.send):
@@ -79,11 +79,11 @@ def sendTraffic(dstLogicalAddr, count, delay, port):
 
     # Added UDP at the end to maybe calm this down a bit.
     PDUToSend = Ether(src = srcPhysicalAddr)/IP(dst = dstLogicalAddr)/ICMP(type=1)
-    generateContinousTraffic(PDUToSend, count, srcPhysicalAddr, delay)
+    generateContinousTraffic(PDUToSend, count, srcPhysicalAddr, delay, port)
 
     return None
 
-def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, delay):
+def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, delay, port):
     # Constants.
     PAYLOAD_DELIMITER_SIZE = 2 # The delimiter is the character '|', of which there are two of them in the payload, each 1 byte.
     MAX_PAYLOAD_LENGTH = 1400 # 1400 bytes fills up frames, but not enough to cause fragmentation with a 1500-byte MTU.
@@ -109,7 +109,7 @@ def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, d
             frameWithCustomPayload = PDUToSend/Raw(load = "{0}|{1}|{2}".format(srcPhysicalAddr, sequenceNumber, 'A' * payloadPadding))
             
             # Send frame.
-            sendp(frameWithCustomPayload, iface="eth1", count = 1, verbose = False)
+            sendp(frameWithCustomPayload, iface=port, count = 1, verbose = False)
 
             sys.stdout.write(f"\rSent {sequenceNumber} frames")
             sys.stdout.flush()
@@ -136,12 +136,12 @@ def recvTraffic(port, captureFilePath):
     srcPhysicalAddr = get_if_hwaddr(port)
 
     filterToUse = "ether src not {} and {}" # example full cmd: tcpdump -i eth1 ether src not 02:de:3a:3f:a2:fd and icmp
-    commandToUse = 'sudo tshark -i eth1 -w {} -F libpcap {}'
+    commandToUse = 'sudo tshark -i {} -w {} -F libpcap {}'
 
     try:
         filterForEIBPTraffic = '"icmp[0] == 1"'
         filterToUse = filterToUse.format(srcPhysicalAddr, filterForEIBPTraffic)
-        commandToUse = commandToUse.format(captureFilePath, filterToUse)
+        commandToUse = commandToUse.format(port, captureFilePath, filterToUse)
         call(commandToUse, shell=True)
 
     except KeyboardInterrupt:
