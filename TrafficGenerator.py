@@ -34,6 +34,16 @@ import os
 frameCounter = {}  # Global dictionary to hold frame/packet payload content for analysis on the receiving end
 
 
+def scriptDir():
+    """Directory containing this script (not the current working directory)."""
+    return Path(__file__).resolve().parent
+
+
+def defaultPcapPath():
+    """Default capture path when -r/--receive is used without a filename."""
+    return Path("/tmp") / "results.pcap"
+
+
 def ensureCaptureFile(path_str: str):
     """
     Ensure the capture file exists and is chmod 777.
@@ -79,25 +89,28 @@ def ensureCaptureFile(path_str: str):
 
 def main():
     # ArgumentParser object to read in command line arguments
-    argParser = argparse.ArgumentParser(description = "Basic traffic generator for protocol reconvergence testing purposes")
+    argParser = argparse.ArgumentParser(description="Basic traffic generator for protocol reconvergence testing purposes")
 
     # Sender arguments.
-    argParser.add_argument("-s", "--send") # Destination (receiver) node
-    argParser.add_argument("-c", "--count", type = int) # The number of frames to send.
-    argParser.add_argument("-d", "--delay", type = float) # Add a delay when sending traffic.
+    argParser.add_argument("-s", "--send")  # Destination (receiver) node
+    argParser.add_argument("-c", "--count", type=int)  # The number of frames to send.
+    argParser.add_argument("-d", "--delay", type=float)  # Add a delay when sending traffic.
 
     # Receiver arguments.
-    # Allow "-r" with no value: defaults to results.pcap
+    # If "-r" is provided without a filename, default to /tmp/results.pcap.
     argParser.add_argument(
         "-r", "--receive",
         nargs="?",
-        const="results.pcap",
-        help="Receive traffic and write to a pcap file (default: results.pcap)"
+        const="__DEFAULT_PCAP__",
+        default=None,
+        help="Receive traffic and write to a pcap file (default: /tmp/results.pcap)"
     )
-    argParser.add_argument("-a", "--analyze") # argument of capture needed
+
+    # Analyze traffic.
+    argParser.add_argument("-a", "--analyze")  # argument of capture needed
 
     # Shared arguments.
-    argParser.add_argument("-e", "--port", default = "eth1") # By default, it's eth1 on our testbeds.
+    argParser.add_argument("-e", "--port", default="eth1")  # By default, it's eth1 on our testbeds.
 
     # Parse the arguments.
     args = argParser.parse_args()
@@ -105,8 +118,12 @@ def main():
 
     # Receive traffic.
     if args.receive is not None:
-        # If user specified -r with no filename, argparse gives const "results.pcap"
-        capture_path = ensureCaptureFile(args.receive)
+        if args.receive == "__DEFAULT_PCAP__":
+            capture_arg = str(defaultPcapPath())
+        else:
+            capture_arg = args.receive
+
+        capture_path = ensureCaptureFile(capture_arg)
         recvTraffic(port, capture_path)
 
     # Send traffic.
@@ -169,13 +186,13 @@ def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, d
             # Send frame.
             sendp(frameWithCustomPayload, iface=port, count=1, verbose=False)
 
-            sys.stdout.write(f"\rSent {sequenceNumber} frames")
+            sys.stdout.write(f"Sent {sequenceNumber} frames")
             sys.stdout.flush()
 
             # Determine if sending has completed.
             if sequenceNumber == numberOfFramesToSend:
                 complete = True
-                print("\nFinished\n")
+                print("Finished")
 
             # Add a delay to sending the next frame if needed.
             if delay is not None:
@@ -183,7 +200,7 @@ def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, d
 
         except KeyboardInterrupt:
             complete = True
-            print("\nFinished\n")
+            print("Finished")
 
     return None
 
@@ -191,17 +208,24 @@ def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, d
 def recvTraffic(port, captureFilePath):
     srcPhysicalAddr = get_if_hwaddr(port)
 
-    filterToUse = "ether src not {} and {}"  # example: ether src not <mac> and icmp...
-    commandToUse = 'sudo tshark -i {} -w {} -F libpcap {}'
+    # Capture filter (BPF): exclude our own source MAC and only match ICMP type 1
+    # NOTE: "icmp[0] == 1" refers to ICMP type in the ICMP header.
+    capture_filter = f"ether src not {srcPhysicalAddr} and icmp[0] == 1"
+
+    # Avoid shell quoting issues by using argv form.
+    command = [
+        "sudo", "tshark",
+        "-i", str(port),
+        "-w", str(captureFilePath),
+        "-F", "libpcap",
+        capture_filter,
+    ]
 
     try:
-        filterForEIBPTraffic = '"icmp[0] == 1"'
-        filterToUse = filterToUse.format(srcPhysicalAddr, filterForEIBPTraffic)
-        commandToUse = commandToUse.format(port, captureFilePath, filterToUse)
-        call(commandToUse, shell=True)
+        call(command)
 
     except KeyboardInterrupt:
-        print("\nExited program")
+        print("Exited program")
 
     return None
 
@@ -212,10 +236,12 @@ def analyzeTraffic(capturePath):
     capture = rdpcap(capturePath)
 
     for frame in capture:
-        if frame[ICMP].type == 1:
+        if frame.haslayer(ICMP) and frame[ICMP].type == 1:
+            if not frame.haslayer(Raw):
+                continue
             payload = frame[Raw].load
         else:
-            sys.exit("Can't find a payload")
+            continue
 
         payload = str(payload, 'utf-8')
         payloadContent = payload.split("|")
@@ -252,16 +278,19 @@ def analyzeTraffic(capturePath):
             frameCounter[source][0] = newSeqNum
             frameCounter[source][2] += 1
 
-    # Write the results file to the same directory the pcap is located.
+    # Write the results file to the same directory as the python script.
     pcap_path = Path(capturePath).expanduser().resolve()
-    pcap_dir = pcap_path.parent
     pcap_stem = pcap_path.stem
 
-    resultFile = pcap_dir / f"{pcap_stem}_result.txt"
+    out_dir = scriptDir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    resultFile = out_dir / f"{pcap_stem}_result.txt"
     f = open(resultFile, "w+")
 
     for source in frameCounter:
-        endStatement = "{0} frames lost from source {1} {2} | {3} received | {4} Not sequential {5} | {6} duplicates {7}\n"
+        endStatement = "{0} frames lost from source {1} {2} | {3} received | {4} Not sequential {5} | {6} duplicates {7}"
+
         outputMissingFrames = ""
         outputUnorderedFrames = ""
         outputDuplicateFrames = ""
@@ -290,6 +319,7 @@ def analyzeTraffic(capturePath):
         ))
 
     f.close()
+    print(f"Wrote results to: {resultFile}")
     return None
 
 
