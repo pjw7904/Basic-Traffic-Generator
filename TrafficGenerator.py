@@ -186,13 +186,13 @@ def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, d
             # Send frame.
             sendp(frameWithCustomPayload, iface=port, count=1, verbose=False)
 
-            sys.stdout.write(f"Sent {sequenceNumber} frames")
+            sys.stdout.write(f"\rSent {sequenceNumber} frames")
             sys.stdout.flush()
 
             # Determine if sending has completed.
             if sequenceNumber == numberOfFramesToSend:
                 complete = True
-                print("Finished")
+                print("\nFinished")
 
             # Add a delay to sending the next frame if needed.
             if delay is not None:
