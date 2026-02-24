@@ -33,15 +33,30 @@ import os
 
 frameCounter = {}  # Global dictionary to hold frame/packet payload content for analysis on the receiving end
 
+DEFAULT_PCAP_SENTINEL = "__DEFAULT_PCAP__"
 
-def scriptDir():
+
+def scriptDir() -> Path:
     """Directory containing this script (not the current working directory)."""
     return Path(__file__).resolve().parent
 
 
-def defaultPcapPath():
-    """Default capture path when -r/--receive is used without a filename."""
+def defaultPcapPath() -> Path:
+    """Default capture path when -r/--receive or -a/--analyze is used without a filename."""
+    # Always use /tmp to avoid SELinux/home labeling issues on some FABRIC images.
     return Path("/tmp") / "results.pcap"
+
+
+def resolvePcapArg(arg_val):
+    """
+    Unify -r/-a behavior:
+
+    - If arg_val is DEFAULT_PCAP_SENTINEL => use defaultPcapPath()
+    - If arg_val is a real string => use it
+    """
+    if arg_val == DEFAULT_PCAP_SENTINEL:
+        return str(defaultPcapPath())
+    return arg_val
 
 
 def ensureCaptureFile(path_str: str):
@@ -49,16 +64,17 @@ def ensureCaptureFile(path_str: str):
     Ensure the capture file exists and is chmod 777.
     Also tries to chown back to the invoking sudo user if possible.
     Returns an absolute path string for tshark.
+
+    Note: This intentionally allows overwriting existing captures.
     """
     p = Path(path_str).expanduser()
 
-    # If relative, make it relative to current working directory
-    # (Path does this naturally; we just resolve to absolute for tshark).
+    # Make sure parent exists
     p_parent = p.parent
     if p_parent and not p_parent.exists():
         p_parent.mkdir(parents=True, exist_ok=True)
 
-    # Touch file
+    # Touch file (ok if it already exists)
     try:
         p.touch(exist_ok=True)
     except Exception as e:
@@ -71,7 +87,6 @@ def ensureCaptureFile(path_str: str):
         sys.exit(f"Failed to chmod 777 on '{p}': {e}")
 
     # If running via sudo, try to set ownership back to original user
-    # so downloads/cleanup are nicer.
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user:
         try:
@@ -88,41 +103,44 @@ def ensureCaptureFile(path_str: str):
 
 
 def main():
-    # ArgumentParser object to read in command line arguments
-    argParser = argparse.ArgumentParser(description="Basic traffic generator for protocol reconvergence testing purposes")
+    argParser = argparse.ArgumentParser(
+        description="Basic traffic generator for protocol reconvergence testing purposes"
+    )
 
     # Sender arguments.
-    argParser.add_argument("-s", "--send")  # Destination (receiver) node
-    argParser.add_argument("-c", "--count", type=int)  # The number of frames to send.
-    argParser.add_argument("-d", "--delay", type=float)  # Add a delay when sending traffic.
+    argParser.add_argument("-s", "--send")                 # Destination (receiver) node
+    argParser.add_argument("-c", "--count", type=int)      # The number of frames to send.
+    argParser.add_argument("-d", "--delay", type=float)    # Add a delay when sending traffic.
 
     # Receiver arguments.
-    # If "-r" is provided without a filename, default to /tmp/results.pcap.
+    # -r with no value => /tmp/results.pcap
     argParser.add_argument(
         "-r", "--receive",
         nargs="?",
-        const="__DEFAULT_PCAP__",
+        const=DEFAULT_PCAP_SENTINEL,
         default=None,
         help="Receive traffic and write to a pcap file (default: /tmp/results.pcap)"
     )
 
-    # Analyze traffic.
-    argParser.add_argument("-a", "--analyze")  # argument of capture needed
+    # Analyzer arguments.
+    # -a with no value => /tmp/results.pcap
+    argParser.add_argument(
+        "-a", "--analyze",
+        nargs="?",
+        const=DEFAULT_PCAP_SENTINEL,
+        default=None,
+        help="Analyze a capture file (default: /tmp/results.pcap)"
+    )
 
     # Shared arguments.
     argParser.add_argument("-e", "--port", default="eth1")  # By default, it's eth1 on our testbeds.
 
-    # Parse the arguments.
     args = argParser.parse_args()
     port = args.port
 
     # Receive traffic.
     if args.receive is not None:
-        if args.receive == "__DEFAULT_PCAP__":
-            capture_arg = str(defaultPcapPath())
-        else:
-            capture_arg = args.receive
-
+        capture_arg = resolvePcapArg(args.receive)
         capture_path = ensureCaptureFile(capture_arg)
         recvTraffic(port, capture_path)
 
@@ -134,22 +152,20 @@ def main():
         sendTraffic(dstLogicalAddr, count, delay, port)
 
     # Analyze traffic.
-    elif args.analyze:
-        captureFile = args.analyze
+    elif args.analyze is not None:
+        captureFile = resolvePcapArg(args.analyze)
         print(f"Working on capture file {captureFile}...")
         analyzeTraffic(captureFile)
 
     else:
-        sys.exit("Syntax error: incorrect arguments (use -h for help)")  # Error out if the arguments are bad or missing.
+        sys.exit("Syntax error: incorrect arguments (use -h for help)")
 
     return None
 
 
 def sendTraffic(dstLogicalAddr, count, delay, port):
-    # Information needed to generate a custom payload and build protocol headers.
     srcPhysicalAddr = get_if_hwaddr(port)
 
-    # Added UDP at the end to maybe calm this down a bit.
     PDUToSend = Ether(src=srcPhysicalAddr) / IP(dst=dstLogicalAddr) / ICMP(type=1)
     generateContinousTraffic(PDUToSend, count, srcPhysicalAddr, delay, port)
 
@@ -157,44 +173,36 @@ def sendTraffic(dstLogicalAddr, count, delay, port):
 
 
 def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, delay, port):
-    # Constants.
-    PAYLOAD_DELIMITER_SIZE = 2  # The delimiter is the character '|', of which there are two of them in the payload, each 1 byte.
-    MAX_PAYLOAD_LENGTH = 1400   # 1400 bytes fills up frames, but not enough to cause fragmentation with a 1500-byte MTU.
+    PAYLOAD_DELIMITER_SIZE = 2
+    MAX_PAYLOAD_LENGTH = 1400
 
-    # Variables that are changed per-frame sent.
     sequenceNumber = 0
     payloadPadding = 0
     complete = False if numberOfFramesToSend is not None else True
 
-    # Continue to send frames until numberOfFramesToSend is reached.
     while not complete:
         try:
             sequenceNumber += 1
 
-            # Determine how much (if any) padding is needed for a given frame before it is sent.
             frameLength = len(str(sequenceNumber) + srcPhysicalAddr) + len(PDUToSend) + PAYLOAD_DELIMITER_SIZE
             if frameLength < MAX_PAYLOAD_LENGTH:
                 payloadPadding = MAX_PAYLOAD_LENGTH - frameLength
             else:
                 payloadPadding = 0
 
-            # Add the test protocol header encapsulated in the ICMP message.
             frameWithCustomPayload = PDUToSend / Raw(
                 load="{0}|{1}|{2}".format(srcPhysicalAddr, sequenceNumber, 'A' * payloadPadding)
             )
 
-            # Send frame.
             sendp(frameWithCustomPayload, iface=port, count=1, verbose=False)
 
             sys.stdout.write(f"\rSent {sequenceNumber} frames")
             sys.stdout.flush()
 
-            # Determine if sending has completed.
             if sequenceNumber == numberOfFramesToSend:
                 complete = True
                 print("\nFinished")
 
-            # Add a delay to sending the next frame if needed.
             if delay is not None:
                 time.sleep(delay)
 
@@ -208,11 +216,9 @@ def generateContinousTraffic(PDUToSend, numberOfFramesToSend, srcPhysicalAddr, d
 def recvTraffic(port, captureFilePath):
     srcPhysicalAddr = get_if_hwaddr(port)
 
-    # Capture filter (BPF): exclude our own source MAC and only match ICMP type 1
-    # NOTE: "icmp[0] == 1" refers to ICMP type in the ICMP header.
+    # BPF capture filter: exclude our own source MAC and only match ICMP type 1
     capture_filter = f"ether src not {srcPhysicalAddr} and icmp[0] == 1"
 
-    # Avoid shell quoting issues by using argv form.
     command = [
         "sudo", "tshark",
         "-i", str(port),
@@ -223,9 +229,8 @@ def recvTraffic(port, captureFilePath):
 
     try:
         call(command)
-
     except KeyboardInterrupt:
-        print("Exited program")
+        print("\nExited program")
 
     return None
 
@@ -233,26 +238,34 @@ def recvTraffic(port, captureFilePath):
 def analyzeTraffic(capturePath):
     frameCounter = {}
 
-    capture = rdpcap(capturePath)
+    pcap_path = Path(capturePath).expanduser().resolve()
+    if not pcap_path.exists():
+        sys.exit(f"Capture file does not exist: {pcap_path}")
+
+    capture = rdpcap(str(pcap_path))
 
     for frame in capture:
-        if frame.haslayer(ICMP) and frame[ICMP].type == 1:
-            if not frame.haslayer(Raw):
-                continue
-            payload = frame[Raw].load
-        else:
+        if not (frame.haslayer(ICMP) and frame[ICMP].type == 1 and frame.haslayer(Raw)):
             continue
 
-        payload = str(payload, 'utf-8')
+        payload = frame[Raw].load
+        payload = str(payload, 'utf-8', errors='replace')
         payloadContent = payload.split("|")
+
+        if len(payloadContent) < 2:
+            continue
+
         source = payloadContent[0]
-        newSeqNum = int(payloadContent[1])
+        try:
+            newSeqNum = int(payloadContent[1])
+        except ValueError:
+            continue
 
         if source not in frameCounter:
             frameCounter[source] = [newSeqNum, [], 1, [], []]
         else:
             currentSeqNum = frameCounter[source][0]
-            expectedNextSeqNum = frameCounter[source][0] + 1
+            expectedNextSeqNum = currentSeqNum + 1
 
             if currentSeqNum == newSeqNum and newSeqNum == 1:
                 continue
@@ -269,7 +282,6 @@ def analyzeTraffic(capturePath):
                 continue
 
             missedFrames = newSeqNum - expectedNextSeqNum
-
             while missedFrames != 0:
                 missingSeqNum = currentSeqNum + missedFrames
                 frameCounter[source][1].append(missingSeqNum)
@@ -279,46 +291,40 @@ def analyzeTraffic(capturePath):
             frameCounter[source][2] += 1
 
     # Write the results file to the same directory as the python script.
-    pcap_path = Path(capturePath).expanduser().resolve()
-    pcap_stem = pcap_path.stem
-
     out_dir = scriptDir()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    resultFile = out_dir / f"{pcap_stem}_result.txt"
-    f = open(resultFile, "w+")
+    resultFile = out_dir / f"{pcap_path.stem}_result.txt"
+    with open(resultFile, "w+") as f:
+        for source in frameCounter:
+            endStatement = "{0} frames lost from source {1} {2} | {3} received | {4} Not sequential {5} | {6} duplicates {7}\n"
+            outputMissingFrames = ""
+            outputUnorderedFrames = ""
+            outputDuplicateFrames = ""
 
-    for source in frameCounter:
-        endStatement = "{0} frames lost from source {1} {2} | {3} received | {4} Not sequential {5} | {6} duplicates {7}"
+            if frameCounter[source][1]:
+                frameCounter[source][1].sort()
+                outputMissingFrames = frameCounter[source][1]
 
-        outputMissingFrames = ""
-        outputUnorderedFrames = ""
-        outputDuplicateFrames = ""
+            if frameCounter[source][3]:
+                frameCounter[source][3].sort()
+                outputUnorderedFrames = frameCounter[source][3]
 
-        if frameCounter[source][1]:
-            frameCounter[source][1].sort()
-            outputMissingFrames = frameCounter[source][1]
+            if frameCounter[source][4]:
+                frameCounter[source][4].sort()
+                outputDuplicateFrames = frameCounter[source][4]
 
-        if frameCounter[source][3]:
-            frameCounter[source][3].sort()
-            outputUnorderedFrames = frameCounter[source][3]
+            f.write(endStatement.format(
+                len(frameCounter[source][1]),
+                source,
+                outputMissingFrames,
+                frameCounter[source][2],
+                len(frameCounter[source][3]),
+                outputUnorderedFrames,
+                len(frameCounter[source][4]),
+                outputDuplicateFrames
+            ))
 
-        if frameCounter[source][4]:
-            frameCounter[source][4].sort()
-            outputDuplicateFrames = frameCounter[source][4]
-
-        f.write(endStatement.format(
-            len(frameCounter[source][1]),
-            source,
-            outputMissingFrames,
-            frameCounter[source][2],
-            len(frameCounter[source][3]),
-            outputUnorderedFrames,
-            len(frameCounter[source][4]),
-            outputDuplicateFrames
-        ))
-
-    f.close()
     print(f"Wrote results to: {resultFile}")
     return None
 
